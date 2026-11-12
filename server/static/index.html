@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LL-HLS 直播测试</title>
+<style>
+  body { background:#111; color:#ddd; font-family:-apple-system, "PingFang SC", sans-serif; margin:0; padding:24px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  video { width:100%; background:#000; border-radius:8px; }
+  button { background:#333; color:#eee; border:1px solid #555; border-radius:6px; padding:6px 12px; margin:4px 4px 4px 0; cursor:pointer; }
+  button.on { background:#0a84ff; border-color:#0a84ff; }
+  .row { display:flex; gap:24px; flex-wrap:wrap; margin-top:12px; }
+  .card { background:#1c1c1e; border-radius:8px; padding:12px 16px; flex:1; min-width:200px; }
+  .val { font-size:26px; font-weight:600; font-variant-numeric: tabular-nums; }
+  .label { color:#888; font-size:13px; margin-bottom:4px; }
+  #log { background:#1c1c1e; border-radius:8px; padding:12px; margin-top:12px; height:140px; overflow:auto; font:12px ui-monospace, monospace; color:#9a9; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2 style="margin:0 0 12px">LL-HLS 直播测试 <span style="font-size:13px;color:#888">画面左上角烧录了毫秒时间码，和下方时钟对比即为端到端延迟</span></h2>
+  <video id="video" controls autoplay muted playsinline></video>
+  <div class="row">
+    <div class="card"><div class="label">当前时间（本机）</div><div class="val" id="clock">--</div></div>
+    <div class="card"><div class="label">端到端延迟（PDT 估算）</div><div class="val" id="edge">--</div></div>
+    <div class="card"><div class="label">hls.js 列表滞后</div><div class="val" id="latency">--</div></div>
+    <div class="card"><div class="label">缓冲 / 分辨率</div><div class="val" id="buffer" style="font-size:16px">--</div></div>
+  </div>
+  <div style="margin-top:12px">
+    码率：<span id="levels"></span>
+  </div>
+  <div id="log"></div>
+</div>
+<script src="/hls.min.js"></script>
+<script>
+const video = document.getElementById('video');
+const logEl = document.getElementById('log');
+function log(msg) {
+  const line = new Date().toISOString().slice(11, 23) + ' ' + msg + '\n';
+  logEl.textContent = (logEl.textContent + line).slice(-4000);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let hls;
+if (Hls.isSupported()) {
+  hls = new Hls({
+    enableWorker: true,
+    lowLatencyMode: true,          // LL-HLS：使用 part、blocking reload
+    liveSyncDuration: 1.2,         // 目标 live edge 距离（秒）
+    liveMaxLatencyDuration: 6,
+    maxLiveSyncPlaybackRate: 1.5,  // 落后时加速追赶
+    backBufferLength: 30,
+  });
+  hls.loadSource('/live/master.m3u8');
+  hls.attachMedia(video);
+
+  hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+    log(`manifest parsed, ${data.levels.length} levels`);
+    renderLevels(data.levels);
+    video.play().catch(() => log('autoplay 被浏览器拦截，请手动点播放'));
+  });
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
+    log(`level switched -> ${d.level}`);
+    markLevel(d.level);
+  });
+  hls.on(Hls.Events.LEVEL_LOADED, (_, d) => {
+    const frag = d.details.fragments;
+    const parts = d.details.partList ? d.details.partList.length : 0;
+    log(`playlist loaded: ${frag.length} frags, ${parts} parts, live=${d.details.live}`);
+  });
+  hls.on(Hls.Events.FRAG_LOADED, () => {});
+  hls.on(Hls.Events.ERROR, (_, d) => {
+    log(`ERROR ${d.type}/${d.details} fatal=${d.fatal}`);
+  });
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+  video.src = '/live/master.m3u8';
+  log('使用浏览器原生 HLS');
+} else {
+  log('当前浏览器不支持 HLS');
+}
+
+function renderLevels(levels) {
+  const box = document.getElementById('levels');
+  box.innerHTML = '';
+  levels.forEach((lv, i) => {
+    const b = document.createElement('button');
+    b.textContent = `${lv.width}x${lv.height} ${Math.round(lv.bitrate / 1000)}kbps`;
+    b.onclick = () => { hls.currentLevel = i; };
+    b.dataset.idx = i;
+    box.appendChild(b);
+  });
+  const auto = document.createElement('button');
+  auto.textContent = 'Auto';
+  auto.onclick = () => { hls.currentLevel = -1; };
+  box.appendChild(auto);
+}
+function markLevel(idx) {
+  document.querySelectorAll('#levels button').forEach((b) => {
+    b.classList.toggle('on', b.dataset.idx == idx);
+  });
+}
+
+// 用片段的 PROGRAM-DATE-TIME + 当前播放位置估算端到端延迟
+function pdtLatency() {
+  try {
+    const idx = hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel;
+    const details = hls.levels[idx] && hls.levels[idx].details;
+    if (!details || !details.fragments) return null;
+    const t = video.currentTime;
+    const frag = details.fragments.find(
+      (f) => f.programDateTime && t >= f.start && t < f.start + f.duration);
+    if (!frag) return null;
+    const wall = (frag.programDateTime instanceof Date
+      ? frag.programDateTime.getTime() : frag.programDateTime) + (t - frag.start) * 1000;
+    return (Date.now() - wall) / 1000;
+  } catch (e) { return null; }
+}
+
+setInterval(() => {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    String(now.getHours()).padStart(2, '0') + ':' +
+    String(now.getMinutes()).padStart(2, '0') + ':' +
+    String(now.getSeconds()).padStart(2, '0') + '.' +
+    String(now.getMilliseconds()).padStart(3, '0');
+
+  if (hls && hls.media) {
+    const listLat = hls.latency;
+    document.getElementById('latency').textContent =
+      listLat != null ? listLat.toFixed(2) + 's' : '--';
+    const lat = pdtLatency();
+    document.getElementById('edge').textContent =
+      lat != null ? lat.toFixed(2) + 's' : '--';
+    const b = video.buffered;
+    const lv = hls.levels[hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel];
+    document.getElementById('buffer').textContent =
+      (b.length ? `${(b.end(b.length - 1) - video.currentTime).toFixed(2)}s` : '空') +
+      (lv ? ` / ${lv.width}x${lv.height}` : '');
+  }
+}, 100);
+</script>
+</body>
+</html>
